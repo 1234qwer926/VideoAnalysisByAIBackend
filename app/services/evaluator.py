@@ -143,6 +143,56 @@ def evaluate_submission_background(submission_id: int):
                 continue
 
             max_score += float(q.points or 10)
+            
+            is_video = q.type in ("video", "audio")
+            has_text = False
+            if r.answer:
+                if isinstance(r.answer, dict):
+                    ans_text = r.answer.get("user_answer_text") or r.answer.get("transcript") or r.answer.get("text") or ""
+                    has_text = bool(str(ans_text).strip())
+                elif isinstance(r.answer, str):
+                    has_text = bool(r.answer.strip())
+
+            # Validation: Bypass Gemini and give 0 if the candidate provided no response
+            if (is_video and not r.s3_key) or (not is_video and not has_text):
+                q_score = 0.0
+                if is_video:
+                    metrics = {
+                        "content_accuracy": 0, "confidence": 0, 
+                        "communication": 0, "facial_expressions": 0, 
+                        "overall_presentation": 0
+                    }
+                    feedback = "No video/audio response was provided by the candidate."
+                else:
+                    metrics = {"content_accuracy": 0, "clarity": 0, "depth": 0}
+                    feedback = "No written response was provided by the candidate."
+
+                r.score = q_score
+                if r.answer and isinstance(r.answer, dict):
+                    r.answer = {
+                        **r.answer,
+                        "ai_score": q_score,
+                        "final_score": r.answer.get("final_score", q_score),
+                        "ai_metrics": metrics,
+                        "ai_feedback": feedback,
+                    }
+                else:
+                    r.answer = {
+                        "ai_score": q_score,
+                        "final_score": q_score,
+                        "ai_metrics": metrics,
+                        "ai_feedback": feedback,
+                    }
+
+                metrics_str = ", ".join(f"{k}: {v}/10" for k, v in metrics.items())
+                overall_feedback_lines.append(
+                    f"Q{q.order or 1}: {q.title}\n"
+                    f"  Score: {q_score}/{q.points or 10}\n"
+                    f"  Metrics: {metrics_str}\n"
+                    f"  Feedback: {feedback}"
+                )
+                continue
+
             prompt_text = _build_eval_prompt(q, knowledge_base, ai_prompt)
 
             contents = [prompt_text]
