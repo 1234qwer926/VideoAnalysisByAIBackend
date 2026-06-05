@@ -2,6 +2,7 @@ import os
 import tempfile
 import json
 import time
+import shutil
 
 from google import genai
 from google.genai import types
@@ -12,7 +13,10 @@ from app.models.submission import Submission, QuestionResponse
 from app.models.assignment import AssignmentUser, Assignment
 from app.models.form import Form, Question
 from app.models.review import Review
-from app.services.s3 import download_file
+from app.services.s3_service import S3Service
+
+LOCAL_UPLOAD_PREFIX = "local_uploads/"
+LOCAL_UPLOAD_ROOT = "/tmp/lms_video_uploads"
 
 
 def _build_eval_prompt(q, knowledge_base: str, ai_prompt: str) -> str:
@@ -22,6 +26,8 @@ def _build_eval_prompt(q, knowledge_base: str, ai_prompt: str) -> str:
     prompt = ""
     if knowledge_base:
         prompt += f"=== KNOWLEDGE BASE ===\n{knowledge_base}\n\n"
+    else:
+        prompt += "=== KNOWLEDGE BASE ===\n(No specific knowledge base provided. Rely entirely on your own internal knowledge to evaluate the answer.)\n\n"
     if ai_prompt:
         prompt += f"=== EVALUATOR INSTRUCTIONS ===\n{ai_prompt}\n\n"
 
@@ -37,7 +43,7 @@ def _build_eval_prompt(q, knowledge_base: str, ai_prompt: str) -> str:
             "=== EVALUATION TASK ===\n"
             "Carefully watch/listen to the candidate's video/audio response.\n"
             "Evaluate the following metrics on a scale of 0–10 each:\n"
-            "  1. content_accuracy   – How accurately does the answer address the question based on the knowledge base?\n"
+            "  1. content_accuracy   – How accurately does the answer address the question? Use the knowledge base if provided, otherwise rely on your internal knowledge.\n"
             "  2. confidence         – How confident and assured is the candidate's delivery?\n"
             "  3. communication      – Clarity, fluency, and articulation.\n"
             "  4. facial_expressions – Eye contact, engagement, positive body language (video only).\n"
@@ -48,7 +54,7 @@ def _build_eval_prompt(q, knowledge_base: str, ai_prompt: str) -> str:
             "=== EVALUATION TASK ===\n"
             "Carefully read the candidate's written answer.\n"
             "Evaluate the following metrics on a scale of 0–10 each:\n"
-            "  1. content_accuracy  – Accuracy and completeness based on the knowledge base.\n"
+            "  1. content_accuracy  – Accuracy and completeness. Use the knowledge base if provided, otherwise rely on your internal knowledge.\n"
             "  2. clarity           – How clearly and logically is the answer structured?\n"
             "  3. depth             – Depth of understanding demonstrated.\n\n"
         )
@@ -151,16 +157,26 @@ def evaluate_submission_background(submission_id: int):
                         temp_path = tmp.name
 
                     downloaded = False
-                    if settings.AWS_ACCESS_KEY_ID:
-                        try:
-                            download_file(r.s3_key, temp_path)
-                            downloaded = True
-                        except Exception as dl_err:
-                            print(f"Warning: Could not download {r.s3_key}: {dl_err}")
-                            contents.append(
-                                "NOTE: The candidate's video file is missing or was not "
-                                "uploaded. Evaluate assuming a non-response."
+                    try:
+                        if r.s3_key.startswith(LOCAL_UPLOAD_PREFIX):
+                            local_path = os.path.join(
+                                LOCAL_UPLOAD_ROOT,
+                                r.s3_key.removeprefix(LOCAL_UPLOAD_PREFIX),
                             )
+                            if os.path.exists(local_path):
+                                shutil.copyfile(local_path, temp_path)
+                                downloaded = True
+                            else:
+                                raise FileNotFoundError(local_path)
+                        else:
+                            S3Service().download_file(r.s3_key, temp_path)
+                            downloaded = True
+                    except Exception as dl_err:
+                        print(f"Warning: Could not download {r.s3_key}: {dl_err}")
+                        contents.append(
+                            "NOTE: The candidate's video file is missing or was not "
+                            "uploaded. Evaluate assuming a non-response."
+                        )
 
                     if downloaded and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
                         # Upload to Gemini File API
@@ -193,9 +209,20 @@ def evaluate_submission_background(submission_id: int):
                 r.score = q_score
                 # Store structured metrics alongside the answer JSON
                 if r.answer and isinstance(r.answer, dict):
-                    r.answer = {**r.answer, "ai_metrics": metrics, "ai_feedback": feedback}
+                    r.answer = {
+                        **r.answer,
+                        "ai_score": q_score,
+                        "final_score": r.answer.get("final_score", q_score),
+                        "ai_metrics": metrics,
+                        "ai_feedback": feedback,
+                    }
                 else:
-                    r.answer = {"ai_metrics": metrics, "ai_feedback": feedback}
+                    r.answer = {
+                        "ai_score": q_score,
+                        "final_score": q_score,
+                        "ai_metrics": metrics,
+                        "ai_feedback": feedback,
+                    }
 
                 total_score += q_score
                 metrics_str = ", ".join(f"{k}: {v}/10" for k, v in metrics.items())

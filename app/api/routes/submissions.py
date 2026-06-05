@@ -1,6 +1,8 @@
 from datetime import datetime
+from pathlib import Path
 import random
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -8,12 +10,15 @@ from app.models.assignment import AssignmentUser, Assignment
 from app.models.form import Form
 from app.models.submission import Submission, QuestionResponse, WarningLog
 from app.schemas.submission import SubmissionCreate, SubmissionOut, WarningCreate
-from app.services.s3 import generate_presigned_upload_url
+from app.services.s3_service import S3Service
 from app.services.evaluator import evaluate_submission_background
 from app.core.config import settings
+from fastapi import File, UploadFile
 
 router = APIRouter(prefix="/exam", tags=["Exam / Submission"])
 _exam_drafts: dict[str, dict] = {}
+LOCAL_UPLOAD_PREFIX = "local_uploads/"
+LOCAL_UPLOAD_ROOT = Path("/tmp/lms_video_uploads")
 
 
 def _question_to_payload(q):
@@ -98,6 +103,25 @@ def _get_assignment_user(token: str, db: Session) -> AssignmentUser:
     return user
 
 
+def _local_upload_path_for_key(key: str) -> Path:
+    relative = key.removeprefix(LOCAL_UPLOAD_PREFIX)
+    return LOCAL_UPLOAD_ROOT / relative
+
+
+async def _save_local_exam_upload(file: UploadFile, user: AssignmentUser, question_id: int) -> dict:
+    suffix = Path(file.filename or f"q{question_id}.webm").suffix or ".webm"
+    timestamp = int(datetime.utcnow().timestamp())
+    relative = f"{user.assignment_id}/{user.id}/q{question_id}_{timestamp}{suffix}"
+    key = f"{LOCAL_UPLOAD_PREFIX}{relative}"
+    target = _local_upload_path_for_key(key)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    contents = await file.read()
+    target.write_bytes(contents)
+
+    return {"key": key, "filename": file.filename or target.name, "verified": True}
+
+
 @router.get("/info")
 def get_exam_info(token: str, db: Session = Depends(get_db)):
     user = _get_assignment_user(token, db)
@@ -151,6 +175,7 @@ def get_upload_url(
     s3_key = f"submissions/{user.assignment_id}/{user.id}/q{question_id}_{int(datetime.utcnow().timestamp())}.webm"
 
     if settings.AWS_ACCESS_KEY_ID:
+        from app.services.s3 import generate_presigned_upload_url
         url = generate_presigned_upload_url(s3_key, content_type=content_type)
     else:
         url = f"http://localhost:9000/{s3_key}"
@@ -159,6 +184,46 @@ def get_upload_url(
         "upload_url": url,
         "s3_key": s3_key
     }
+
+@router.post("/upload-video")
+async def upload_video(
+    token: str,
+    question_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    user = _get_assignment_user(token, db)
+    
+    try:
+        if not file.filename:
+            file.filename = f"q{question_id}.webm"
+
+        try:
+            s3_service = S3Service()
+            result = await s3_service.upload_file_with_verification(file)
+        except Exception as s3_error:
+            print(f"Warning: S3 upload failed, falling back to local storage: {s3_error}")
+            result = await _save_local_exam_upload(file, user, question_id)
+
+        return {
+            "s3_key": result["key"],
+            "filename": result["filename"],
+            "verified": result.get("verified", False)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/local-video")
+def get_local_video(key: str, db: Session = Depends(get_db)):
+    if not key.startswith(LOCAL_UPLOAD_PREFIX):
+        raise HTTPException(status_code=400, detail="Invalid local video key")
+
+    path = _local_upload_path_for_key(key)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    return FileResponse(path, media_type="video/webm", content_disposition_type="inline")
 
 
 @router.post("/save")
