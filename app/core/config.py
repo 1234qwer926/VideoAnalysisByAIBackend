@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     ])
     ENABLE_DEV_ADMIN_BYPASS: bool = False
     GEMINI_API_KEY: str = ""
+    GOOGLE_CLIENT_ID: str = ""
     class Config:
         env_file = ".env"
 
