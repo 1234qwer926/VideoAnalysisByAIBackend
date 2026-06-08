@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: [
         "http://localhost:3000",
         "http://localhost:5173",
+        "https://lms.pk7386510581.workers.dev",
     ])
     ENABLE_DEV_ADMIN_BYPASS: bool = False
     GEMINI_API_KEY: str = ""
