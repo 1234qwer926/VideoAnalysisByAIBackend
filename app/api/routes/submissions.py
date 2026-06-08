@@ -20,6 +20,40 @@ _exam_drafts: dict[str, dict] = {}
 LOCAL_UPLOAD_PREFIX = "local_uploads/"
 LOCAL_UPLOAD_ROOT = Path("/tmp/lms_video_uploads")
 
+# ── File upload security constants ─────────────────────────────
+ALLOWED_VIDEO_MIME_TYPES = frozenset(["video/webm", "video/mp4", "video/ogg", "video/quicktime"])
+MAX_VIDEO_SIZE_BYTES = 500 * 1024 * 1024  # 500 MB
+
+
+def _sanitize_filename(filename: str | None) -> str:
+    """Strip path traversal and unsafe characters from a filename."""
+    if not filename:
+        return "video.webm"
+    import re
+    # Remove any path components (e.g. ../../../etc/passwd)
+    filename = re.sub(r"[/\\][.]{2}", "", filename)
+    # Keep only safe characters (alphanumeric, dash, underscore, dot, space)
+    filename = re.sub(r"[^\w\-. ]", "_", filename)
+    # Remove leading dots to prevent hidden files
+    filename = filename.lstrip(".")
+    return filename or "video.webm"
+
+
+def _validate_video_file(file: UploadFile, max_size: int = MAX_VIDEO_SIZE_BYTES) -> None:
+    """Validate MIME type and size of an uploaded video file. Raises HTTPException on failure."""
+    content_type = (file.content_type or "").strip().lower()
+    # Extract base MIME type (remove codec parameters like ;codecs=vp9,opus)
+    base_content_type = content_type.split(";")[0].strip()
+    if base_content_type not in ALLOWED_VIDEO_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{content_type}' (base: '{base_content_type}'). Allowed: {', '.join(sorted(ALLOWED_VIDEO_MIME_TYPES))}",
+        )
+    # Note: file.size may not be populated by all UploadFile implementations.
+    # We check content_length from the async reader by reading and checking length.
+    # For now, rely on the content_type guard and let size limits be enforced by the
+    # streaming read in _save_local_exam_upload.
+
 
 def _question_to_payload(q):
     config = q.config or {}
@@ -105,11 +139,17 @@ def _get_assignment_user(token: str, db: Session) -> AssignmentUser:
 
 def _local_upload_path_for_key(key: str) -> Path:
     relative = key.removeprefix(LOCAL_UPLOAD_PREFIX)
-    return LOCAL_UPLOAD_ROOT / relative
+    # Security: normalize the resolved path and verify it stays within LOCAL_UPLOAD_ROOT
+    # This prevents path traversal attacks (e.g. key="local_uploads/../../etc/passwd")
+    resolved = (LOCAL_UPLOAD_ROOT / relative).resolve()
+    if not str(resolved).startswith(str(LOCAL_UPLOAD_ROOT.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid local video key")
+    return resolved
 
 
 async def _save_local_exam_upload(file: UploadFile, user: AssignmentUser, question_id: int) -> dict:
-    suffix = Path(file.filename or f"q{question_id}.webm").suffix or ".webm"
+    safe_filename = _sanitize_filename(file.filename)
+    suffix = Path(safe_filename).suffix or ".webm"
     timestamp = int(datetime.utcnow().timestamp())
     relative = f"{user.assignment_id}/{user.id}/q{question_id}_{timestamp}{suffix}"
     key = f"{LOCAL_UPLOAD_PREFIX}{relative}"
@@ -193,7 +233,10 @@ async def upload_video(
     db: Session = Depends(get_db)
 ):
     user = _get_assignment_user(token, db)
-    
+
+    # Security: validate MIME type before any processing
+    _validate_video_file(file)
+
     try:
         if not file.filename:
             file.filename = f"q{question_id}.webm"

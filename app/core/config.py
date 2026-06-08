@@ -1,9 +1,21 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, field_validator
+import secrets
+
+# ── Startup security checks ─────────────────────────────────────
+def _warn_weak_secret():
+    import warnings
+    warnings.warn(
+        "SECRET_KEY is using a weak default value. "
+        "Set SECRET_KEY environment variable to a strong random string in production.",
+        UserWarning,
+    )
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql://postgres:password@localhost:5432/video_interview_db"
-    SECRET_KEY: str = "dev_secret_key"
+    DATABASE_URL: str = Field(default="postgresql://postgres:password@localhost:5432/video_interview_db")
+    # Generate a secure default if SECRET_KEY is not set — but still warn since
+    # env-var override is strongly preferred for production.
+    SECRET_KEY: str = Field(default_factory=lambda: _warn_weak_secret() or secrets.token_urlsafe(32))
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     AWS_ACCESS_KEY_ID: str = ""
@@ -15,7 +27,7 @@ class Settings(BaseSettings):
     SMTP_USER: str = ""
     SMTP_PASSWORD: str = ""
     EMAIL_FROM: str = ""
-    ENV: str = "development"
+    ENV: str = Field(default="production")
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: [
         "http://localhost:3000",
         "http://localhost:5173",

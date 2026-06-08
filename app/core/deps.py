@@ -13,8 +13,15 @@ def get_current_admin(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ) -> Admin:
-    # Optional explicit dev bypass.
-    if settings.ENV == "development" and settings.ENABLE_DEV_ADMIN_BYPASS:
+    # SECURITY: Explicitly reject ENABLE_DEV_ADMIN_BYPASS unless ENV is explicitly "development"
+    # This prevents the bypass from activating if ENV is misconfigured to any other value
+    # (including empty string, "prod", "production", etc.)
+    if settings.ENABLE_DEV_ADMIN_BYPASS:
+        if settings.ENV != "development":
+            raise HTTPException(
+                status_code=403,
+                detail="Dev admin bypass is only allowed when ENV=development"
+            )
         email = token
         admin = db.query(Admin).filter(Admin.email == email).first()
         if not admin:

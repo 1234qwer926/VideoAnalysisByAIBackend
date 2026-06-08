@@ -33,7 +33,9 @@ class AssignmentUserOut(BaseModel):
     email: str
     deadline: Optional[datetime] = None
     status: str
-    token: str
+    # token intentionally omitted — it is a secret access token and must never be
+    # exposed in API responses that may reach an untrusted caller.
+    # Admin-only endpoints that need the token should use a separate response model.
     email_sent: bool
 
     class Config:

@@ -9,8 +9,9 @@ def get_s3_client():
         aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
     )
 
-def generate_presigned_upload_url(key: str, content_type: str = "video/webm", expires: int = 3600) -> str:
-    """Pre-signed PUT URL — browser uploads video directly to S3."""
+def generate_presigned_upload_url(key: str, content_type: str = "video/webm", expires: int = 300) -> str:
+    """Pre-signed PUT URL — browser uploads video directly to S3.
+    Default 5 minutes (reduced from 1 hour) to limit exposure if a URL is leaked."""
     s3 = get_s3_client()
     return s3.generate_presigned_url(
         "put_object",
@@ -22,8 +23,9 @@ def generate_presigned_upload_url(key: str, content_type: str = "video/webm", ex
         ExpiresIn=expires,
     )
 
-def generate_presigned_view_url(key: str, expires: int = 3600) -> str:
-    """Pre-signed GET URL — admin plays back video in browser."""
+def generate_presigned_view_url(key: str, expires: int = 600) -> str:
+    """Pre-signed GET URL — admin plays back video in browser.
+    Default 10 minutes (reduced from 1 hour)."""
     s3 = get_s3_client()
     return s3.generate_presigned_url(
         "get_object",

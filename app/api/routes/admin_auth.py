@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import secrets
@@ -9,8 +9,9 @@ from app.models.admin import Admin
 from app.core.security import verify_password, create_access_token, hash_password
 from app.core.deps import get_current_admin
 from app.core.config import settings
+from app.core.rate_limit import limiter, LOGIN_RATE_LIMIT, GOOGLE_LOGIN_RATE_LIMIT, PASSWORD_RESET_RATE_LIMIT, REGISTER_RATE_LIMIT
 from app.schemas.admin import (
-    AdminLogin, Token, AdminOut,
+    AdminLogin, AdminRegister, Token, AdminOut,
     GoogleAuthRequest, ForgotPasswordRequest, ResetPasswordRequest,
 )
 from app.services.email import send_password_reset_email
@@ -26,7 +27,8 @@ router = APIRouter(prefix="/admin/auth", tags=["Admin Auth"])
 
 # ── Email + Password Login ──────────────────────────────────────
 @router.post("/login", response_model=Token)
-def login(payload: AdminLogin, db: Session = Depends(get_db)):
+@limiter.limit(LOGIN_RATE_LIMIT)
+def login(request: Request, payload: AdminLogin, db: Session = Depends(get_db)):
     admin = db.query(Admin).filter(Admin.email == payload.email).first()
     if not admin or not verify_password(payload.password, admin.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -36,7 +38,8 @@ def login(payload: AdminLogin, db: Session = Depends(get_db)):
 
 # ── Google OAuth Login ──────────────────────────────────────────
 @router.post("/google-login", response_model=Token)
-def admin_google_login(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
+@limiter.limit(GOOGLE_LOGIN_RATE_LIMIT)
+def admin_google_login(request: Request, payload: GoogleAuthRequest, db: Session = Depends(get_db)):
     try:
         client_id = os.environ.get("GOOGLE_CLIENT_ID") or settings.GOOGLE_CLIENT_ID
         if not client_id:
@@ -66,7 +69,8 @@ def admin_google_login(payload: GoogleAuthRequest, db: Session = Depends(get_db)
 
 # ── Forgot Password ────────────────────────────────────────────
 @router.post("/forgot-password")
-def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+@limiter.limit(PASSWORD_RESET_RATE_LIMIT)
+def forgot_password(request: Request, payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
     admin = db.query(Admin).filter(Admin.email == payload.email).first()
 
     # Always return success to avoid email enumeration
@@ -95,7 +99,8 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
 
 # ── Reset Password ──────────────────────────────────────────────
 @router.post("/reset-password")
-def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
+@limiter.limit(PASSWORD_RESET_RATE_LIMIT)
+def reset_password(request: Request, payload: ResetPasswordRequest, db: Session = Depends(get_db)):
     admin = db.query(Admin).filter(Admin.reset_token == payload.token).first()
 
     if not admin:
@@ -108,9 +113,7 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
         db.commit()
         raise HTTPException(status_code=400, detail="Reset token has expired. Please request a new one.")
 
-    if len(payload.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-
+    # Password strength is now enforced by ResetPasswordRequest schema (12+ chars, complexity)
     admin.hashed_password = hash_password(payload.new_password)
     admin.reset_token = None
     admin.reset_token_expires = None
@@ -119,10 +122,37 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     return {"message": "Password has been reset successfully"}
 
 
+# ── Set HttpOnly Session Cookie ───────────────────────────────
+# This endpoint allows the frontend to migrate from localStorage to httpOnly cookies.
+# The frontend calls this after login with the JWT token; the backend sets an HttpOnly,
+# SameSite=Strict cookie that the browser will send automatically on subsequent requests.
+@router.post("/set-session-cookie")
+@limiter.limit("60/minute")  # High limit — this is a utility endpoint
+async def set_session_cookie(request: Request, response: Response):
+    body = await request.json()
+    token = body.get("token")
+    role = body.get("role", "admin")
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+
+    response.set_cookie(
+        key=f"{role}_session_token",
+        value=token,
+        httponly=True,
+        samesite="strict",
+        secure=(settings.ENV == "production"),  # Secure flag only in production
+        max_age=60 * 60 * settings.ACCESS_TOKEN_EXPIRE_MINUTES,  # Match JWT expiry
+        path="/",
+    )
+    return {"message": "Session cookie set"}
+
+
 # ── Register (Protected — requires existing admin) ──────────────
 @router.post("/register", response_model=AdminOut)
+@limiter.limit(REGISTER_RATE_LIMIT)
 def register(
-    payload: AdminLogin,
+    request: Request,
+    payload: AdminRegister,
     db: Session = Depends(get_db),
     current_admin: Admin = Depends(get_current_admin),
 ):
