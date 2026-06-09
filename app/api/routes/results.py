@@ -68,15 +68,38 @@ def _average_metric_dicts(metric_dicts: list[dict]) -> dict:
 
 @router.get("")
 def list_results(
+    assignment_id: int | None = None,
     db: Session = Depends(get_db),
     _=Depends(get_current_admin)
 ):
-    users = db.query(AssignmentUser).all()
+    query = db.query(AssignmentUser)
+    if assignment_id:
+        query = query.filter(AssignmentUser.assignment_id == assignment_id)
+        
+    users = query.all()
+    if not users:
+        return []
+
+    assignment_ids = {u.assignment_id for u in users if u.assignment_id}
+    assignments = {}
+    if assignment_ids:
+        assignments = {a.id: a for a in db.query(Assignment).filter(Assignment.id.in_(assignment_ids)).all()}
+        
+    user_ids = {u.id for u in users}
+    submissions_list = db.query(Submission).filter(Submission.assignment_user_id.in_(user_ids)).all()
+    submissions = {s.assignment_user_id: s for s in submissions_list}
+    
+    submission_ids = {s.id for s in submissions.values()}
+    reviews = {}
+    if submission_ids:
+        reviews = {r.submission_id: r for r in db.query(Review).filter(Review.submission_id.in_(submission_ids)).all()}
+        
     rows = []
     for u in users:
-        assignment = db.query(Assignment).filter(Assignment.id == u.assignment_id).first()
-        sub = db.query(Submission).filter(Submission.assignment_user_id == u.id).first()
-        review = db.query(Review).filter(Review.submission_id == sub.id).first() if sub else None
+        assignment = assignments.get(u.assignment_id)
+        sub = submissions.get(u.id)
+        review = reviews.get(sub.id) if sub else None
+        
         rows.append({
             "id": sub.id if sub else u.id,
             "submission_id": sub.id if sub else None,
@@ -100,19 +123,29 @@ def get_assignment_results(
     users = db.query(AssignmentUser).filter(
         AssignmentUser.assignment_id == assignment_id
     ).all()
+    
+    if not users:
+        return []
+
+    user_ids = {u.id for u in users}
+    submissions_list = db.query(Submission).filter(Submission.assignment_user_id.in_(user_ids)).all()
+    submissions = {s.assignment_user_id: s for s in submissions_list}
+    
+    submission_ids = {s.id for s in submissions.values()}
+    warnings_counts = {}
+    if submission_ids:
+        # We can group by submission_id to count warnings
+        from sqlalchemy import func
+        counts = db.query(
+            WarningLog.submission_id, 
+            func.count(WarningLog.id)
+        ).filter(WarningLog.submission_id.in_(submission_ids)).group_by(WarningLog.submission_id).all()
+        warnings_counts = {sub_id: count for sub_id, count in counts}
 
     result = []
-
     for u in users:
-        sub = db.query(Submission).filter(
-            Submission.assignment_user_id == u.id
-        ).first()
-
-        warning_count = 0
-        if sub:
-            warning_count = db.query(WarningLog).filter(
-                WarningLog.submission_id == sub.id
-            ).count()
+        sub = submissions.get(u.id)
+        warning_count = warnings_counts.get(sub.id, 0) if sub else 0
 
         result.append({
             "user_id": u.id,
